@@ -24,7 +24,7 @@ build:
   # The WASM plugin configuration structure name
   model: PluginConfig
   # Enable debug mode
-  debug: false
+  debug: true
 
 test:
   # Test environment name, that is a docker compose project name
@@ -49,4 +49,4 @@ install:
   # If 'from-go-src' is non-empty, the output type of the build option must be 'image'
   from-go-src:
   # Enable debug mode
-  debug: false
+  debug: true

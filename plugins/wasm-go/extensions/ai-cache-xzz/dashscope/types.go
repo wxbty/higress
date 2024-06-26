@@ -27,7 +27,7 @@ type Output struct {
 }
 
 type Embedding struct {
-	Embedding []float32 `json:"embedding"`
+	Embedding []float64 `json:"embedding"`
 	TextIndex int32     `json:"text_index"`
 }
 

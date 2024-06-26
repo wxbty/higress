@@ -23,7 +23,6 @@ const (
 	PartialMessageContextKey = "partialMessage"
 	ToolCallsContextKey      = "toolCalls"
 	StreamContextKey         = "stream"
-	DefaultCacheKeyPrefix    = "higress-ai-cache-xzz:"
 )
 
 func main() {
@@ -32,6 +31,8 @@ func main() {
 		wrapper.ParseConfigBy(parseConfig),
 		wrapper.ProcessRequestHeadersBy(onHttpRequestHeaders),
 		wrapper.ProcessRequestBodyBy(onHttpRequestBody),
+		wrapper.ProcessResponseHeadersBy(onHttpResponseHeaders),
+		wrapper.ProcessStreamingResponseBodyBy(onHttpResponseBody),
 	)
 }
 
@@ -63,13 +64,12 @@ type Doc struct {
 	Vector []float64 `json:"vector"`
 }
 
-type Fields struct {
-	DATA string `json:"data"`
+type Docs struct {
+	Docs []Doc `json:"docs"`
 }
 
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+type Fields struct {
+	DATA string `json:"data"`
 }
 
 type KVExtractor struct {
@@ -232,47 +232,13 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config AIRagConfig, log wrap
 	return types.ActionContinue
 }
 
-func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byte, isLastChunk bool, log wrapper.Log) []byte {
+func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byte, _ bool, log wrapper.Log) []byte {
 	if ctx.GetContext(ToolCallsContextKey) != nil {
 		// we should not cache tool call result
 		return chunk
 	}
 	keyI := ctx.GetContext(CacheKeyContextKey)
 	if keyI == nil {
-		return chunk
-	}
-	if !isLastChunk {
-		stream := ctx.GetContext(StreamContextKey)
-		if stream == nil {
-			tempContentI := ctx.GetContext(CacheContentContextKey)
-			if tempContentI == nil {
-				ctx.SetContext(CacheContentContextKey, chunk)
-				return chunk
-			}
-			tempContent := tempContentI.([]byte)
-			tempContent = append(tempContent, chunk...)
-			ctx.SetContext(CacheContentContextKey, tempContent)
-		} else {
-			var partialMessage []byte
-			partialMessageI := ctx.GetContext(PartialMessageContextKey)
-			if partialMessageI != nil {
-				partialMessage = append(partialMessageI.([]byte), chunk...)
-			} else {
-				partialMessage = chunk
-			}
-			messages := strings.Split(string(partialMessage), "\n\n")
-			for i, msg := range messages {
-				if i < len(messages)-1 {
-					// process complete message
-					processSSEMessage(ctx, config, msg, log)
-				}
-			}
-			if !strings.HasSuffix(string(partialMessage), "\n\n") {
-				ctx.SetContext(PartialMessageContextKey, []byte(messages[len(messages)-1]))
-			} else {
-				ctx.SetContext(PartialMessageContextKey, nil)
-			}
-		}
 		return chunk
 	}
 	// last chunk
@@ -318,63 +284,55 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 			value = tempContentI.(string)
 		}
 	}
-	config.redisClient.Set(config.CacheKeyPrefix+key, value, nil)
-	if config.CacheTTL != 0 {
-		config.redisClient.Expire(config.CacheKeyPrefix+key, config.CacheTTL, nil)
-	}
 
-	// 提取向量并创建Doc数组
-	docs := make([]Doc, len(response.Output.Embeddings))
-	for i, embedding := range response.Output.Embeddings {
-		docID := fmt.Sprintf("doc_%d", embedding.TextIndex) // 假设ID根据text_index生成
-		docs[i] = Doc{
-			ID:     docID,
-			Vector: embedding.Embedding,
-			FIELDS: Fields{
-				DATA: val,
-			},
-		}
-	}
-
-	// 使用中间结构体序列化 docs 数组
-	docsObj := Docs{Docs: docs}
-
-	// 序列化JSON
-	jsonData, err = json.Marshal(docsObj)
-	if err != nil {
-		fmt.Println("Error marshalling JSON:", err)
-		return
-	}
-
-	requestQuery := dashvector.Request{
-		TopK:         1,
-		OutputFileds: []string{"raw"},
-		Vector:       responseEmbedding.Output.Embeddings[0].Embedding,
-	}
-	requestQuerySerialized, _ := json.Marshal(requestQuery)
-
-	config.DashVectorClient.Post(
-		fmt.Sprintf("/v1/collections/%s/query", config.DashVectorCollection),
-		[][2]string{{"Content-Type", "application/json"}, {"dashvector-auth-token", config.DashVectorAPIKey}},
-		requestQuerySerialized,
-		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			var response dashvector.Response
-			_ = json.Unmarshal(responseBody, &response)
-			objects := response.Output
-			if len(objects) == 0 {
-				log.Infof("cache miss, key:%s", rawContent)
-				proxywasm.ResumeHttpRequest()
-				return
-			}
-			doc := objects[0].Fields.Raw
-			if objects[0].Score < 0.2 {
-				proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnStreamResponseTemplate, doc)), -1)
-			} else {
-				log.Infof("cache miss, score:%f, key:%s", objects[0].Score, rawContent)
-				proxywasm.ResumeHttpRequest()
-				return
-			}
+	requestEmbedding := dashscope.Request{
+		Model: "text-embedding-v1",
+		Input: dashscope.Input{
+			Texts: []string{key},
 		},
+		Parameter: dashscope.Parameter{
+			TextType: "query",
+		},
+	}
+	headers := [][2]string{{"Content-Type", "application/json"}, {"Authorization", "Bearer " + config.DashScopeAPIKey}}
+	reqEmbeddingSerialized, _ := json.Marshal(requestEmbedding)
+	config.DashScopeClient.Post(
+		"/api/v1/services/embeddings/text-embedding/text-embedding",
+		headers,
+		reqEmbeddingSerialized,
+		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+			var responseEmbedding dashscope.Response
+			_ = json.Unmarshal(responseBody, &responseEmbedding)
+
+			// 提取向量并创建Doc数组
+			docs := make([]Doc, len(responseEmbedding.Output.Embeddings))
+			for i, embedding := range responseEmbedding.Output.Embeddings {
+				docID := fmt.Sprintf("doc_%d", embedding.TextIndex) // 假设ID根据text_index生成
+				docs[i] = Doc{
+					ID:     docID,
+					Vector: embedding.Embedding,
+					FIELDS: Fields{
+						DATA: value,
+					},
+				}
+			}
+
+			// 使用中间结构体序列化 docs 数组
+			docsObj := Docs{Docs: docs}
+			// 序列化JSON
+			requestDocSerialized, _ := json.Marshal(docsObj)
+
+			config.DashVectorClient.Post(
+				fmt.Sprintf("/v1/collections/%s/docs", config.DashVectorCollection),
+				[][2]string{{"Content-Type", "application/json"}, {"dashvector-auth-token", config.DashVectorAPIKey}},
+				requestDocSerialized,
+				func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+					log.Warnf("save doc,key:%s, body:%s", key, responseBody)
+				},
+			)
+		},
+		50000,
 	)
+
 	return chunk
 }

@@ -4,7 +4,7 @@ package dashvector
 type Request struct {
 	TopK         int32     `json:"topk"`
 	OutputFileds []string  `json:"output_fileds"`
-	Vector       []float32 `json:"vector"`
+	Vector       []float64 `json:"vector"`
 }
 
 // DashVecotor document search: Response

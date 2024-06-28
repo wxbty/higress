@@ -94,6 +94,27 @@ func parseConfig(json gjson.Result, config *AIRagConfig, log wrapper.Log) error 
 		Port:        json.Get("dashvector.servicePort").Int(),
 		Domain:      json.Get("dashvector.domain").String(),
 	})
+
+	config.CacheKeyFrom.RequestBody = json.Get("cacheKeyFrom.requestBody").String()
+	if config.CacheKeyFrom.RequestBody == "" {
+		config.CacheKeyFrom.RequestBody = "messages.@reverse.0.content"
+	}
+	config.CacheValueFrom.ResponseBody = json.Get("cacheValueFrom.responseBody").String()
+	if config.CacheValueFrom.ResponseBody == "" {
+		config.CacheValueFrom.ResponseBody = "choices.0.message.content"
+	}
+	config.CacheStreamValueFrom.ResponseBody = json.Get("cacheStreamValueFrom.responseBody").String()
+	if config.CacheStreamValueFrom.ResponseBody == "" {
+		config.CacheStreamValueFrom.ResponseBody = "choices.0.delta.content"
+	}
+	config.ReturnResponseTemplate = json.Get("returnResponseTemplate").String()
+	if config.ReturnResponseTemplate == "" {
+		config.ReturnResponseTemplate = `{"id":"from-cache","choices":[{"index":0,"message":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"model":"gpt-4o","object":"chat.completion","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`
+	}
+	config.ReturnStreamResponseTemplate = json.Get("returnStreamResponseTemplate").String()
+	if config.ReturnStreamResponseTemplate == "" {
+		config.ReturnStreamResponseTemplate = `data:{"id":"from-cache","choices":[{"index":0,"delta":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"model":"gpt-4o","object":"chat.completion","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}` + "\n\ndata:[DONE]\n\n"
+	}
 	return nil
 }
 
@@ -120,13 +141,9 @@ func TrimQuote(source string) string {
 
 func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte, log wrapper.Log) types.Action {
 	bodyJson := gjson.ParseBytes(body)
-	// TODO: It may be necessary to support stream mode determination for different LLM providers.
-	if bodyJson.Get("stream").Bool() {
 
-		ctx.SetContext(StreamContextKey, struct{}{})
-	} else if ctx.GetContext(StreamContextKey) != nil {
+	log.Infof("request body message:%s", bodyJson)
 
-	}
 	rawContent := TrimQuote(bodyJson.Get(config.CacheKeyFrom.RequestBody).Raw)
 	if rawContent == "" {
 		log.Debug("parse key from request body failed")
@@ -151,6 +168,9 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 		headers,
 		reqEmbeddingSerialized,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+
+			log.Infof("text-embedding,key:%s, body:%s,status:%d", rawContent, responseBody, statusCode)
+
 			var responseEmbedding dashscope.Response
 			_ = json.Unmarshal(responseBody, &responseEmbedding)
 			requestQuery := dashvector.Request{
@@ -164,6 +184,9 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 				[][2]string{{"Content-Type", "application/json"}, {"dashvector-auth-token", config.DashVectorAPIKey}},
 				requestQuerySerialized,
 				func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+
+					log.Infof("text-query,query_key:%s, body:%s,status:%d", requestQuerySerialized, responseBody, statusCode)
+
 					var response dashvector.Response
 					_ = json.Unmarshal(responseBody, &response)
 					objects := response.Output
@@ -233,6 +256,9 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config AIRagConfig, log wrap
 }
 
 func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byte, _ bool, log wrapper.Log) []byte {
+
+	log.Info("onHttpResponseBody body message")
+
 	if ctx.GetContext(ToolCallsContextKey) != nil {
 		// we should not cache tool call result
 		return chunk

@@ -169,7 +169,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 		reqEmbeddingSerialized,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
 
-			log.Infof("text-embedding,key:%s, body:%s,status:%d", rawContent, responseBody, statusCode)
+			log.Infof("text-embedding,key:%s,status:%d", rawContent, statusCode)
 
 			var responseEmbedding dashscope.Response
 			_ = json.Unmarshal(responseBody, &responseEmbedding)
@@ -185,7 +185,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 				requestQuerySerialized,
 				func(statusCode int, responseHeaders http.Header, responseBody []byte) {
 
-					log.Infof("text-query,query_key:%s, body:%s,status:%d", requestQuerySerialized, responseBody, statusCode)
+					log.Infof("text-query by text embedding, body:%s,status:%d", responseBody, statusCode)
 
 					var response dashvector.Response
 					_ = json.Unmarshal(responseBody, &response)
@@ -204,6 +204,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 						return
 					}
 				},
+				50000,
 			)
 		},
 		50000,

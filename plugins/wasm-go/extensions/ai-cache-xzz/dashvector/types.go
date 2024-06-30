@@ -22,5 +22,5 @@ type OutputObject struct {
 }
 
 type FieldObject struct {
-	Raw string `json:"raw"`
+	Data string `json:"data"`
 }

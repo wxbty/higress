@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache-xzz/dashscope"
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache-xzz/dashvector"
+	"math/rand"
 	"net/http"
 	"strings"
 
@@ -19,6 +20,7 @@ import (
 
 const (
 	CacheKeyContextKey       = "cacheKey"
+	CacheEmbeddingKey        = "cacheEmbeddingKey"
 	CacheContentContextKey   = "cacheContent"
 	PartialMessageContextKey = "partialMessage"
 	ToolCallsContextKey      = "toolCalls"
@@ -173,11 +175,15 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 
 			var responseEmbedding dashscope.Response
 			_ = json.Unmarshal(responseBody, &responseEmbedding)
+			ebd := responseEmbedding.Output.Embeddings[0]
+			embedding := ebd.Embedding
 			requestQuery := dashvector.Request{
 				TopK:         1,
 				OutputFileds: []string{"raw"},
-				Vector:       responseEmbedding.Output.Embeddings[0].Embedding,
+				Vector:       embedding,
 			}
+			ctx.SetContext(CacheEmbeddingKey, ebd)
+
 			requestQuerySerialized, _ := json.Marshal(requestQuery)
 			config.DashVectorClient.Post(
 				fmt.Sprintf("/v1/collections/%s/query", config.DashVectorCollection),
@@ -195,9 +201,10 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 						proxywasm.ResumeHttpRequest()
 						return
 					}
-					doc := objects[0].Fields.Raw
+					doc := objects[0].Fields.Data
 					if objects[0].Score < 0.2 {
-						proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnStreamResponseTemplate, doc)), -1)
+						log.Debugf("cache hit, key:%s", rawContent)
+						proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, doc)), -1)
 					} else {
 						log.Infof("cache miss, score:%f, key:%s", objects[0].Score, rawContent)
 						proxywasm.ResumeHttpRequest()
@@ -264,102 +271,72 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 		// we should not cache tool call result
 		return chunk
 	}
+
+	log.Info("onHttpResponseBody body message 1")
 	keyI := ctx.GetContext(CacheKeyContextKey)
 	if keyI == nil {
 		return chunk
 	}
+
+	keyE := ctx.GetContext(CacheEmbeddingKey)
+	if keyE == nil {
+		return chunk
+	}
+
+	log.Info("onHttpResponseBody body message 2")
 	// last chunk
 	key := keyI.(string)
-	stream := ctx.GetContext(StreamContextKey)
 	var value string
-	if stream == nil {
-		var body []byte
-		tempContentI := ctx.GetContext(CacheContentContextKey)
-		if tempContentI != nil {
-			body = append(tempContentI.([]byte), chunk...)
-		} else {
-			body = chunk
-		}
-		bodyJson := gjson.ParseBytes(body)
-
-		value = TrimQuote(bodyJson.Get(config.CacheValueFrom.ResponseBody).Raw)
-		if value == "" {
-			log.Warnf("parse value from response body failded, body:%s", body)
-			return chunk
-		}
+	log.Info("onHttpResponseBody body message 3")
+	var body []byte
+	tempContentI := ctx.GetContext(CacheContentContextKey)
+	if tempContentI != nil {
+		body = append(tempContentI.([]byte), chunk...)
 	} else {
-		if len(chunk) > 0 {
-			var lastMessage []byte
-			partialMessageI := ctx.GetContext(PartialMessageContextKey)
-			if partialMessageI != nil {
-				lastMessage = append(partialMessageI.([]byte), chunk...)
-			} else {
-				lastMessage = chunk
-			}
-			if !strings.HasSuffix(string(lastMessage), "\n\n") {
-				log.Warnf("invalid lastMessage:%s", lastMessage)
-				return chunk
-			}
-			// remove the last \n\n
-			lastMessage = lastMessage[:len(lastMessage)-2]
-			value = processSSEMessage(ctx, config, string(lastMessage), log)
-		} else {
-			tempContentI := ctx.GetContext(CacheContentContextKey)
-			if tempContentI == nil {
-				return chunk
-			}
-			value = tempContentI.(string)
-		}
+		body = chunk
+	}
+	bodyJson := gjson.ParseBytes(body)
+	log.Infof("onHttpResponseBody body message body:%s 4", body)
+
+	value = TrimQuote(bodyJson.Get(config.CacheValueFrom.ResponseBody).Raw)
+	if value == "" {
+		log.Warnf("parse value from response body failded, body:%s", body)
+		return chunk
+	}
+	log.Infof("onHttpResponseBody body message value:%s 5", value)
+	keyEbd := keyE.(dashscope.Embedding)
+	// 提取向量并创建Doc数组
+	docs := make([]Doc, 1)
+	docID := fmt.Sprintf("doc_%d", rand.Intn(90000)+10000) // 假设ID根据text_index生成
+	docs[0] = Doc{
+		ID:     docID,
+		Vector: keyEbd.Embedding,
+		FIELDS: Fields{
+			DATA: value,
+		},
 	}
 
-	requestEmbedding := dashscope.Request{
-		Model: "text-embedding-v1",
-		Input: dashscope.Input{
-			Texts: []string{key},
-		},
-		Parameter: dashscope.Parameter{
-			TextType: "query",
-		},
-	}
-	headers := [][2]string{{"Content-Type", "application/json"}, {"Authorization", "Bearer " + config.DashScopeAPIKey}}
-	reqEmbeddingSerialized, _ := json.Marshal(requestEmbedding)
-	config.DashScopeClient.Post(
-		"/api/v1/services/embeddings/text-embedding/text-embedding",
-		headers,
-		reqEmbeddingSerialized,
+	// 使用中间结构体序列化 docs 数组
+	docsObj := Docs{Docs: docs}
+	// 序列化JSON
+	requestDocSerialized, _ := json.Marshal(docsObj)
+
+	log.Info("onHttpResponseBody body message 12")
+
+	err := config.DashVectorClient.Post(
+		fmt.Sprintf("/v1/collections/%s/docs", config.DashVectorCollection),
+		[][2]string{{"Content-Type", "application/json"}, {"dashvector-auth-token", config.DashVectorAPIKey}},
+		requestDocSerialized,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			var responseEmbedding dashscope.Response
-			_ = json.Unmarshal(responseBody, &responseEmbedding)
-
-			// 提取向量并创建Doc数组
-			docs := make([]Doc, len(responseEmbedding.Output.Embeddings))
-			for i, embedding := range responseEmbedding.Output.Embeddings {
-				docID := fmt.Sprintf("doc_%d", embedding.TextIndex) // 假设ID根据text_index生成
-				docs[i] = Doc{
-					ID:     docID,
-					Vector: embedding.Embedding,
-					FIELDS: Fields{
-						DATA: value,
-					},
-				}
-			}
-
-			// 使用中间结构体序列化 docs 数组
-			docsObj := Docs{Docs: docs}
-			// 序列化JSON
-			requestDocSerialized, _ := json.Marshal(docsObj)
-
-			config.DashVectorClient.Post(
-				fmt.Sprintf("/v1/collections/%s/docs", config.DashVectorCollection),
-				[][2]string{{"Content-Type", "application/json"}, {"dashvector-auth-token", config.DashVectorAPIKey}},
-				requestDocSerialized,
-				func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-					log.Warnf("save doc,key:%s, body:%s", key, responseBody)
-				},
-			)
+			log.Warnf("save doc,key:%s, body:%s", key, responseBody)
 		},
 		50000,
 	)
+
+	log.Info("onHttpResponseBody body message 13")
+	if err != nil {
+		fmt.Printf("failed to post: %s", err)
+	}
 
 	return chunk
 }

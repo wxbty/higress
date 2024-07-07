@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache-xzz/dashscope"
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache-xzz/dashvector"
+	"github.com/tidwall/sjson"
 	"math/rand"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/wrapper"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
@@ -76,6 +78,7 @@ type Fields struct {
 
 type KVExtractor struct {
 	// @Title zh-CN 从请求 Body 中基于 [GJSON PATH](https://github.com/tidwall/gjson/blob/master/SYNTAX.md) 语法提取字符串
+	Prefix      string `required:"false" yaml:"prefix" json:"prefix"`
 	RequestBody string `required:"false" yaml:"requestBody" json:"requestBody"`
 	// @Title zh-CN 从响应 Body 中基于 [GJSON PATH](https://github.com/tidwall/gjson/blob/master/SYNTAX.md) 语法提取字符串
 	ResponseBody string `required:"false" yaml:"responseBody" json:"responseBody"`
@@ -151,6 +154,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 		log.Debug("parse key from request body failed")
 		return types.ActionContinue
 	}
+	log.Infof("request body message key:%s", rawContent)
 	ctx.SetContext(CacheKeyContextKey, rawContent)
 
 	requestEmbedding := dashscope.Request{
@@ -198,12 +202,24 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 					objects := response.Output
 					if len(objects) == 0 {
 						log.Infof("cache miss, key:%s", rawContent)
+
+						newContent := config.CacheKeyFrom.Prefix + rawContent
+						log.Infof("new content:%s", newContent)
+						newBody, err := sjson.SetRawBytes(body, config.CacheKeyFrom.RequestBody, []byte(newContent))
+						if err != nil {
+							log.Errorf("Failed to set new value in JSON: %v", err)
+						}
+						// 替换请求体
+						if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
+							log.Errorf("Failed to replace HTTP request body: %v", err)
+						}
 						proxywasm.ResumeHttpRequest()
 						return
 					}
 					doc := objects[0].Fields.Data
-					if objects[0].Score < 0.2 {
+					if objects[0].Score < 0.27 {
 						log.Debugf("cache hit, key:%s", rawContent)
+						ctx.SetContext(ToolCallsContextKey, struct{}{})
 						proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, doc)), -1)
 					} else {
 						log.Infof("cache miss, score:%f, key:%s", objects[0].Score, rawContent)
@@ -263,16 +279,14 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config AIRagConfig, log wrap
 	return types.ActionContinue
 }
 
-func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byte, _ bool, log wrapper.Log) []byte {
+func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byte, isLastChunk bool, log wrapper.Log) []byte {
 
 	log.Info("onHttpResponseBody body message")
 
 	if ctx.GetContext(ToolCallsContextKey) != nil {
-		// we should not cache tool call result
 		return chunk
 	}
 
-	log.Info("onHttpResponseBody body message 1")
 	keyI := ctx.GetContext(CacheKeyContextKey)
 	if keyI == nil {
 		return chunk
@@ -283,30 +297,94 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 		return chunk
 	}
 
+	if !isLastChunk {
+		stream := ctx.GetContext(StreamContextKey)
+		if stream == nil {
+			tempContentI := ctx.GetContext(CacheContentContextKey)
+			if tempContentI == nil {
+				ctx.SetContext(CacheContentContextKey, chunk)
+				return chunk
+			}
+			tempContent := tempContentI.([]byte)
+			tempContent = append(tempContent, chunk...)
+			ctx.SetContext(CacheContentContextKey, tempContent)
+		} else {
+			var partialMessage []byte
+			partialMessageI := ctx.GetContext(PartialMessageContextKey)
+			if partialMessageI != nil {
+				partialMessage = append(partialMessageI.([]byte), chunk...)
+			} else {
+				partialMessage = chunk
+			}
+			messages := strings.Split(string(partialMessage), "\n\n")
+			for i, msg := range messages {
+				if i < len(messages)-1 {
+					// process complete message
+					processSSEMessage(ctx, config, msg, log)
+				}
+			}
+			if !strings.HasSuffix(string(partialMessage), "\n\n") {
+				ctx.SetContext(PartialMessageContextKey, []byte(messages[len(messages)-1]))
+			} else {
+				ctx.SetContext(PartialMessageContextKey, nil)
+			}
+		}
+		return chunk
+	}
+
 	log.Info("onHttpResponseBody body message 2")
 	// last chunk
 	key := keyI.(string)
 	var value string
-	log.Info("onHttpResponseBody body message 3")
-	var body []byte
-	tempContentI := ctx.GetContext(CacheContentContextKey)
-	if tempContentI != nil {
-		body = append(tempContentI.([]byte), chunk...)
-	} else {
-		body = chunk
-	}
-	bodyJson := gjson.ParseBytes(body)
-	log.Infof("onHttpResponseBody body message body:%s 4", body)
+	stream := ctx.GetContext(StreamContextKey)
 
-	value = TrimQuote(bodyJson.Get(config.CacheValueFrom.ResponseBody).Raw)
-	if value == "" {
-		log.Warnf("parse value from response body failded, body:%s", body)
-		return chunk
+	log.Info("onHttpResponseBody body message 3")
+
+	if stream == nil {
+		var body []byte
+		tempContentI := ctx.GetContext(CacheContentContextKey)
+		if tempContentI != nil {
+			body = append(tempContentI.([]byte), chunk...)
+		} else {
+			body = chunk
+		}
+		bodyJson := gjson.ParseBytes(body)
+
+		value = TrimQuote(bodyJson.Get(config.CacheValueFrom.ResponseBody).Raw)
+		if value == "" {
+			log.Warnf("parse value from response body failded, body:%s", body)
+			return chunk
+		}
+	} else {
+		if len(chunk) > 0 {
+			var lastMessage []byte
+			partialMessageI := ctx.GetContext(PartialMessageContextKey)
+			if partialMessageI != nil {
+				lastMessage = append(partialMessageI.([]byte), chunk...)
+			} else {
+				lastMessage = chunk
+			}
+			if !strings.HasSuffix(string(lastMessage), "\n\n") {
+				log.Warnf("invalid lastMessage:%s", lastMessage)
+				return chunk
+			}
+			// remove the last \n\n
+			lastMessage = lastMessage[:len(lastMessage)-2]
+			value = processSSEMessage(ctx, config, string(lastMessage), log)
+		} else {
+			tempContentI := ctx.GetContext(CacheContentContextKey)
+			if tempContentI == nil {
+				return chunk
+			}
+			value = tempContentI.(string)
+		}
 	}
+
 	log.Infof("onHttpResponseBody body message value:%s 5", value)
 	keyEbd := keyE.(dashscope.Embedding)
 	// 提取向量并创建Doc数组
 	docs := make([]Doc, 1)
+	rand.Seed(time.Now().UnixNano())
 	docID := fmt.Sprintf("doc_%d", rand.Intn(90000)+10000) // 假设ID根据text_index生成
 	docs[0] = Doc{
 		ID:     docID,
@@ -321,8 +399,6 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 	// 序列化JSON
 	requestDocSerialized, _ := json.Marshal(docsObj)
 
-	log.Info("onHttpResponseBody body message 12")
-
 	err := config.DashVectorClient.Post(
 		fmt.Sprintf("/v1/collections/%s/docs", config.DashVectorCollection),
 		[][2]string{{"Content-Type", "application/json"}, {"dashvector-auth-token", config.DashVectorAPIKey}},
@@ -333,7 +409,6 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 		50000,
 	)
 
-	log.Info("onHttpResponseBody body message 13")
 	if err != nil {
 		fmt.Printf("failed to post: %s", err)
 	}

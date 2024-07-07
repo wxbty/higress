@@ -202,6 +202,16 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 					objects := response.Output
 					if len(objects) == 0 {
 						log.Infof("cache miss, key:%s", rawContent)
+						proxywasm.ResumeHttpRequest()
+						return
+					}
+					doc := objects[0].Fields.Data
+					if objects[0].Score < 0.27 {
+						log.Debugf("cache hit, key:%s", rawContent)
+						ctx.SetContext(ToolCallsContextKey, struct{}{})
+						proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, doc)), -1)
+					} else {
+						log.Infof("cache miss, score:%f, key:%s", objects[0].Score, rawContent)
 
 						newContent := config.CacheKeyFrom.Prefix + rawContent
 						log.Infof("new content:%s", newContent)
@@ -213,16 +223,6 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 						if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
 							log.Errorf("Failed to replace HTTP request body: %v", err)
 						}
-						proxywasm.ResumeHttpRequest()
-						return
-					}
-					doc := objects[0].Fields.Data
-					if objects[0].Score < 0.27 {
-						log.Debugf("cache hit, key:%s", rawContent)
-						ctx.SetContext(ToolCallsContextKey, struct{}{})
-						proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, doc)), -1)
-					} else {
-						log.Infof("cache miss, score:%f, key:%s", objects[0].Score, rawContent)
 						proxywasm.ResumeHttpRequest()
 						return
 					}

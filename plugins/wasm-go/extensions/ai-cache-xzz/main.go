@@ -78,8 +78,9 @@ type Fields struct {
 
 type KVExtractor struct {
 	// @Title zh-CN 从请求 Body 中基于 [GJSON PATH](https://github.com/tidwall/gjson/blob/master/SYNTAX.md) 语法提取字符串
-	Prefix      string `required:"false" yaml:"prefix" json:"prefix"`
-	RequestBody string `required:"false" yaml:"requestBody" json:"requestBody"`
+	Prefix       string `required:"false" yaml:"prefix" json:"prefix"`
+	RequestBody  string `required:"false" yaml:"requestBody" json:"requestBody"`
+	RequestBodyT string `required:"false" yaml:"requestBodyT" json:"requestBodyT"`
 	// @Title zh-CN 从响应 Body 中基于 [GJSON PATH](https://github.com/tidwall/gjson/blob/master/SYNTAX.md) 语法提取字符串
 	ResponseBody string `required:"false" yaml:"responseBody" json:"responseBody"`
 }
@@ -100,9 +101,14 @@ func parseConfig(json gjson.Result, config *AIRagConfig, log wrapper.Log) error 
 		Domain:      json.Get("dashvector.domain").String(),
 	})
 
+	config.CacheKeyFrom.Prefix = json.Get("cacheKeyFrom.prefix").String()
 	config.CacheKeyFrom.RequestBody = json.Get("cacheKeyFrom.requestBody").String()
 	if config.CacheKeyFrom.RequestBody == "" {
 		config.CacheKeyFrom.RequestBody = "messages.@reverse.0.content"
+	}
+	config.CacheKeyFrom.RequestBodyT = json.Get("cacheKeyFrom.requestBodyT").String()
+	if config.CacheKeyFrom.RequestBodyT == "" {
+		config.CacheKeyFrom.RequestBodyT = "messages.2.content"
 	}
 	config.CacheValueFrom.ResponseBody = json.Get("cacheValueFrom.responseBody").String()
 	if config.CacheValueFrom.ResponseBody == "" {
@@ -151,7 +157,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 
 	rawContent := TrimQuote(bodyJson.Get(config.CacheKeyFrom.RequestBody).Raw)
 	if rawContent == "" {
-		log.Debug("parse key from request body failed")
+		log.Debugf("parse key from request body failed,cached:%s", config.CacheKeyFrom.RequestBody)
 		return types.ActionContinue
 	}
 	log.Infof("request body message key:%s", rawContent)
@@ -201,7 +207,17 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 					_ = json.Unmarshal(responseBody, &response)
 					objects := response.Output
 					if len(objects) == 0 {
-						log.Infof("cache miss, key:%s", rawContent)
+						log.Infof("cache miss, key0:%s", rawContent)
+						newContent := config.CacheKeyFrom.Prefix + rawContent
+						log.Infof("new content0:%s", newContent)
+						newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
+						if err != nil {
+							log.Errorf("Failed to set new value in JSON: %v", err)
+						}
+						// 替换请求体
+						if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
+							log.Errorf("Failed to replace HTTP request body: %v", err)
+						}
 						proxywasm.ResumeHttpRequest()
 						return
 					}
@@ -215,7 +231,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 
 						newContent := config.CacheKeyFrom.Prefix + rawContent
 						log.Infof("new content:%s", newContent)
-						newBody, err := sjson.SetRawBytes(body, config.CacheKeyFrom.RequestBody, []byte(newContent))
+						newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
 						if err != nil {
 							log.Errorf("Failed to set new value in JSON: %v", err)
 						}

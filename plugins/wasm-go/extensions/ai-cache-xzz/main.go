@@ -187,53 +187,72 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 			proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, localQsVal)), -1)
 		}
 
+		log.Infof("localQsVal not exist, begin query embedding service")
 		ctx.SetContext(CacheEmbeddingKey, ebd)
 		embedding.QueryValByEmbeddingKey(config.DashVectorClient, config.DashVectorAPIKey, config.DashVectorCollection, keyEmbedding, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
 			var response dashvector.Response
 			_ = json.Unmarshal(responseBody, &response)
 			objects := response.Output
-			if len(objects) > 0 {
-				doc := objects[0].Fields.Data
-				score := objects[0].Score
-				if score < 0.27 {
-					// 计算答案的相似度
-					embedding.GetEmbedding(config.DashScopeClient, config.DashScopeAPIKey, doc, "", func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-						_, answerV := getEbd(responseBody)
-						similarity := lcache.CosineSimilarity(keyEmbedding, answerV)
-						if similarity > 0.4 {
-							log.Infof("vector cache hit, score: %f,similarity: %f", score, similarity)
-							ctx.SetContext(ToolCallsContextKey, struct{}{})
-							proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, doc)), -1)
-						} else {
-							fmt.Println("vector cache miss, because key and answer is not similarity score:", score, "similarity:", similarity)
-							newContent := config.CacheKeyFrom.Prefix + rawContent
-							log.Infof("new content:%s", newContent)
-							newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
-							if err != nil {
-								log.Errorf("Failed to set new value in JSON: %v", err)
-							}
-							// 替换请求体
-							if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
-								log.Errorf("Failed to replace HTTP request body: %v", err)
-							}
-							proxywasm.ResumeHttpRequest()
-						}
-					})
+			log.Infof("QueryValByEmbeddingKey response:%d", len(objects))
 
-				} else {
-					fmt.Println("cache miss, score:", score)
-					newContent := config.CacheKeyFrom.Prefix + rawContent
-					log.Infof("new content:%s", newContent)
-					newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
-					if err != nil {
-						log.Errorf("Failed to set new value in JSON: %v", err)
-					}
-					// 替换请求体
-					if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
-						log.Errorf("Failed to replace HTTP request body: %v", err)
-					}
-					proxywasm.ResumeHttpRequest()
+			if len(objects) == 0 {
+				log.Infof("ebd cache miss, key:%s", rawContent)
+				newContent := config.CacheKeyFrom.Prefix + rawContent
+				log.Infof("new content:%s", newContent)
+				newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
+				if err != nil {
+					log.Errorf("Failed to set new value in JSON: %v", err)
 				}
+				// 替换请求体
+				if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
+					log.Errorf("Failed to replace HTTP request body: %v", err)
+				}
+				proxywasm.ResumeHttpRequest()
+				return
+			}
+
+			doc := objects[0].Fields.Data
+			score := objects[0].Score
+			log.Infof("QueryValByEmbeddingKey response:%s,score:%f", doc, score)
+			if score < 0.27 {
+				// 计算答案的相似度
+				embedding.GetEmbedding(config.DashScopeClient, config.DashScopeAPIKey, doc, "", func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+					_, answerV := getEbd(responseBody)
+					similarity := lcache.CosineSimilarity(keyEmbedding, answerV)
+					log.Infof("answerV, score: %f,similarity: %f", score, similarity)
+					if similarity > 0.4 {
+						log.Infof("vector cache hit, score: %f,similarity: %f", score, similarity)
+						ctx.SetContext(ToolCallsContextKey, struct{}{})
+						proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, doc)), -1)
+					} else {
+						log.Infof("vector cache miss, because key and answer is not similarity score:%f,similarity: %f", score, similarity)
+						newContent := config.CacheKeyFrom.Prefix + rawContent
+						log.Infof("new content:%s", newContent)
+						newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
+						if err != nil {
+							log.Errorf("Failed to set new value in JSON: %v", err)
+						}
+						// 替换请求体
+						if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
+							log.Errorf("Failed to replace HTTP request body: %v", err)
+						}
+						proxywasm.ResumeHttpRequest()
+					}
+				})
+
+			} else {
+				log.Infof("cache miss, score:%f", score)
+				newContent := config.CacheKeyFrom.Prefix + rawContent
+				log.Infof("new content:%s", newContent)
+				newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
+				if err != nil {
+					log.Errorf("Failed to set new value in JSON: %v", err)
+				}
+				// 替换请求体
+				if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
+					log.Errorf("Failed to replace HTTP request body: %v", err)
+				}
+				proxywasm.ResumeHttpRequest()
 			}
 		})
 

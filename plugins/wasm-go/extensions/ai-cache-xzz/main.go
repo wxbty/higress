@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache-xzz/dashscope"
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache-xzz/dashvector"
+	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache-xzz/embedding"
+	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache-xzz/lcache"
 	"github.com/tidwall/sjson"
 	"math/rand"
 	"net/http"
@@ -23,13 +25,17 @@ import (
 const (
 	CacheKeyContextKey       = "cacheKey"
 	CacheEmbeddingKey        = "cacheEmbeddingKey"
+	PreTwoEmbeddingKey       = "preTwoEmbeddingKey"
 	CacheContentContextKey   = "cacheContent"
 	PartialMessageContextKey = "partialMessage"
 	ToolCallsContextKey      = "toolCalls"
 	StreamContextKey         = "stream"
 )
 
+var localCache *lcache.Cache
+
 func main() {
+	localCache = lcache.NewCache()
 	wrapper.SetCtx(
 		"ai-cache-xzz",
 		wrapper.ParseConfigBy(parseConfig),
@@ -150,6 +156,8 @@ func TrimQuote(source string) string {
 	return strings.Trim(source, `"`)
 }
 
+var preQs = ""
+
 func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte, log wrapper.Log) types.Action {
 	bodyJson := gjson.ParseBytes(body)
 
@@ -163,93 +171,83 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 	log.Infof("request body message key:%s", rawContent)
 	ctx.SetContext(CacheKeyContextKey, rawContent)
 
-	requestEmbedding := dashscope.Request{
-		Model: "text-embedding-v1",
-		Input: dashscope.Input{
-			Texts: []string{rawContent},
-		},
-		Parameter: dashscope.Parameter{
-			TextType: "query",
-		},
-	}
-	headers := [][2]string{{"Content-Type", "application/json"}, {"Authorization", "Bearer " + config.DashScopeAPIKey}}
-	reqEmbeddingSerialized, _ := json.Marshal(requestEmbedding)
+	embedding.GetEmbedding(config.DashScopeClient, config.DashScopeAPIKey, rawContent, preQs, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+		_, preTwo := getEbd(responseBody)
+		ctx.SetContext(PreTwoEmbeddingKey, preTwo)
+	})
 
-	config.DashScopeClient.Post(
-		"/api/v1/services/embeddings/text-embedding/text-embedding",
-		headers,
-		reqEmbeddingSerialized,
-		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+	embedding.GetEmbedding(config.DashScopeClient, config.DashScopeAPIKey, rawContent, "", func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+		log.Infof("text-keyEmbedding,key:%s,status:%d", rawContent, statusCode)
 
-			log.Infof("text-embedding,key:%s,status:%d", rawContent, statusCode)
+		ebd, keyEmbedding := getEbd(responseBody)
 
-			var responseEmbedding dashscope.Response
-			_ = json.Unmarshal(responseBody, &responseEmbedding)
-			ebd := responseEmbedding.Output.Embeddings[0]
-			embedding := ebd.Embedding
-			requestQuery := dashvector.Request{
-				TopK:         1,
-				OutputFileds: []string{"raw"},
-				Vector:       embedding,
+		localQsVal := localCache.RetrieveBestAnswer(rawContent, keyEmbedding)
+		if localQsVal != "" {
+			ctx.SetContext(ToolCallsContextKey, struct{}{})
+			proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, localQsVal)), -1)
+		}
+
+		ctx.SetContext(CacheEmbeddingKey, ebd)
+		embedding.QueryValByEmbeddingKey(config.DashVectorClient, config.DashVectorAPIKey, config.DashVectorCollection, keyEmbedding, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+			var response dashvector.Response
+			_ = json.Unmarshal(responseBody, &response)
+			objects := response.Output
+			if len(objects) > 0 {
+				doc := objects[0].Fields.Data
+				score := objects[0].Score
+				if score < 0.27 {
+					// 计算答案的相似度
+					embedding.GetEmbedding(config.DashScopeClient, config.DashScopeAPIKey, doc, "", func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+						_, answerV := getEbd(responseBody)
+						similarity := lcache.CosineSimilarity(keyEmbedding, answerV)
+						if similarity > 0.4 {
+							log.Infof("vector cache hit, score: %f,similarity: %f", score, similarity)
+							ctx.SetContext(ToolCallsContextKey, struct{}{})
+							proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, doc)), -1)
+						} else {
+							fmt.Println("vector cache miss, because key and answer is not similarity score:", score, "similarity:", similarity)
+							newContent := config.CacheKeyFrom.Prefix + rawContent
+							log.Infof("new content:%s", newContent)
+							newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
+							if err != nil {
+								log.Errorf("Failed to set new value in JSON: %v", err)
+							}
+							// 替换请求体
+							if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
+								log.Errorf("Failed to replace HTTP request body: %v", err)
+							}
+							proxywasm.ResumeHttpRequest()
+						}
+					})
+
+				} else {
+					fmt.Println("cache miss, score:", score)
+					newContent := config.CacheKeyFrom.Prefix + rawContent
+					log.Infof("new content:%s", newContent)
+					newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
+					if err != nil {
+						log.Errorf("Failed to set new value in JSON: %v", err)
+					}
+					// 替换请求体
+					if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
+						log.Errorf("Failed to replace HTTP request body: %v", err)
+					}
+					proxywasm.ResumeHttpRequest()
+				}
 			}
-			ctx.SetContext(CacheEmbeddingKey, ebd)
+		})
 
-			requestQuerySerialized, _ := json.Marshal(requestQuery)
-			config.DashVectorClient.Post(
-				fmt.Sprintf("/v1/collections/%s/query", config.DashVectorCollection),
-				[][2]string{{"Content-Type", "application/json"}, {"dashvector-auth-token", config.DashVectorAPIKey}},
-				requestQuerySerialized,
-				func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-
-					log.Infof("text-query by text embedding, body:%s,status:%d", responseBody, statusCode)
-
-					var response dashvector.Response
-					_ = json.Unmarshal(responseBody, &response)
-					objects := response.Output
-					if len(objects) == 0 {
-						log.Infof("cache miss, key0:%s", rawContent)
-						newContent := config.CacheKeyFrom.Prefix + rawContent
-						log.Infof("new content0:%s", newContent)
-						newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
-						if err != nil {
-							log.Errorf("Failed to set new value in JSON: %v", err)
-						}
-						// 替换请求体
-						if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
-							log.Errorf("Failed to replace HTTP request body: %v", err)
-						}
-						proxywasm.ResumeHttpRequest()
-						return
-					}
-					doc := objects[0].Fields.Data
-					if objects[0].Score < 0.27 {
-						log.Debugf("cache hit, key:%s", rawContent)
-						ctx.SetContext(ToolCallsContextKey, struct{}{})
-						proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, doc)), -1)
-					} else {
-						log.Infof("cache miss, score:%f, key:%s", objects[0].Score, rawContent)
-
-						newContent := config.CacheKeyFrom.Prefix + rawContent
-						log.Infof("new content:%s", newContent)
-						newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
-						if err != nil {
-							log.Errorf("Failed to set new value in JSON: %v", err)
-						}
-						// 替换请求体
-						if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
-							log.Errorf("Failed to replace HTTP request body: %v", err)
-						}
-						proxywasm.ResumeHttpRequest()
-						return
-					}
-				},
-				50000,
-			)
-		},
-		50000,
-	)
+	})
 
 	return types.ActionPause
+}
+
+func getEbd(responseBody []byte) (dashscope.Embedding, []float64) {
+	var responseEmbedding dashscope.Response
+	_ = json.Unmarshal(responseBody, &responseEmbedding)
+	ebd := responseEmbedding.Output.Embeddings[0]
+	keyEmbedding := ebd.Embedding
+	return ebd, keyEmbedding
 }
 
 func processSSEMessage(ctx wrapper.HttpContext, config AIRagConfig, sseMessage string, log wrapper.Log) string {
@@ -313,6 +311,11 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 		return chunk
 	}
 
+	preTwoVector := ctx.GetContext(PreTwoEmbeddingKey)
+	if preTwoVector == nil {
+		return chunk
+	}
+
 	if !isLastChunk {
 		stream := ctx.GetContext(StreamContextKey)
 		if stream == nil {
@@ -350,8 +353,8 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 
 	log.Info("onHttpResponseBody body message 2")
 	// last chunk
-	key := keyI.(string)
-	var value string
+	question := keyI.(string)
+	var answer string
 	stream := ctx.GetContext(StreamContextKey)
 
 	log.Info("onHttpResponseBody body message 3")
@@ -366,9 +369,9 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 		}
 		bodyJson := gjson.ParseBytes(body)
 
-		value = TrimQuote(bodyJson.Get(config.CacheValueFrom.ResponseBody).Raw)
-		if value == "" {
-			log.Warnf("parse value from response body failded, body:%s", body)
+		answer = TrimQuote(bodyJson.Get(config.CacheValueFrom.ResponseBody).Raw)
+		if answer == "" {
+			log.Warnf("parse answer from response body failded, body:%s", body)
 			return chunk
 		}
 	} else {
@@ -386,27 +389,33 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 			}
 			// remove the last \n\n
 			lastMessage = lastMessage[:len(lastMessage)-2]
-			value = processSSEMessage(ctx, config, string(lastMessage), log)
+			answer = processSSEMessage(ctx, config, string(lastMessage), log)
 		} else {
 			tempContentI := ctx.GetContext(CacheContentContextKey)
 			if tempContentI == nil {
 				return chunk
 			}
-			value = tempContentI.(string)
+			answer = tempContentI.(string)
 		}
 	}
 
-	log.Infof("onHttpResponseBody body message value:%s 5", value)
+	log.Infof("onHttpResponseBody body message answer:%s 5", answer)
 	keyEbd := keyE.(dashscope.Embedding)
 	// 提取向量并创建Doc数组
 	docs := make([]Doc, 1)
 	rand.Seed(time.Now().UnixNano())
 	docID := fmt.Sprintf("doc_%d", rand.Intn(90000)+10000) // 假设ID根据text_index生成
+
+	embedding.GetEmbedding(config.DashScopeClient, config.DashScopeAPIKey, answer, "", func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+		_, answerVector := getEbd(responseBody)
+		localCache.AddToCache(docID, question, preQs, answer, answerVector, keyEbd.Embedding)
+	})
+
 	docs[0] = Doc{
 		ID:     docID,
 		Vector: keyEbd.Embedding,
 		FIELDS: Fields{
-			DATA: value,
+			DATA: answer,
 		},
 	}
 
@@ -420,7 +429,7 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 		[][2]string{{"Content-Type", "application/json"}, {"dashvector-auth-token", config.DashVectorAPIKey}},
 		requestDocSerialized,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			log.Warnf("save doc,key:%s, body:%s", key, responseBody)
+			log.Warnf("save doc,question:%s, body:%s", question, responseBody)
 		},
 		50000,
 	)
@@ -428,6 +437,8 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 	if err != nil {
 		fmt.Printf("failed to post: %s", err)
 	}
+
+	preQs = question
 
 	return chunk
 }

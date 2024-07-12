@@ -1,13 +1,13 @@
 package dashvector
 
-// DashVecotor document search: Request
+// Request DashVecotor document search: Request
 type Request struct {
 	TopK         int32     `json:"topk"`
 	OutputFileds []string  `json:"output_fileds"`
 	Vector       []float64 `json:"vector"`
 }
 
-// DashVecotor document search: Response
+// Response DashVecotor document search: Response
 type Response struct {
 	Code      int32          `json:"code"`
 	RequestID string         `json:"request_id"`

@@ -156,6 +156,9 @@ func TrimQuote(source string) string {
 	return strings.Trim(source, `"`)
 }
 
+// 定义一个动态string全局集合
+var allQs []string = make([]string, 0)
+
 var preQs = ""
 
 func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte, log wrapper.Log) types.Action {
@@ -168,6 +171,9 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 		log.Debugf("parse key from request body failed,cached:%s", config.CacheKeyFrom.RequestBody)
 		return types.ActionContinue
 	}
+	allQs = append(allQs, rawContent)
+	log.Infof("allQs:%s", allQs)
+
 	log.Infof("request body message key:%s", rawContent)
 	ctx.SetContext(CacheKeyContextKey, rawContent)
 

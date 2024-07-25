@@ -20,6 +20,7 @@ import (
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 	"github.com/tidwall/gjson"
+	"github.com/yanyiwu/gojieba"
 )
 
 const (
@@ -466,4 +467,53 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 	preQs = question
 
 	return chunk
+}
+
+func isSentenceComplete(sentence string) bool {
+	if !hasEndingPunctuation(sentence) {
+		return false
+	}
+
+	jieba := gojieba.NewJieba()
+	segList := jieba.Cut(sentence, true)
+
+	var wordTypes []string
+	for _, word := range segList {
+		words := jieba.Tag(word)
+		wordType := words[0]
+		wordType = strings.Split(wordType, "/")[1]
+		wordTypes = append(wordTypes, wordType)
+	}
+
+	nounCount := 0
+	verbCount := 0
+	hasAdverb := false
+
+	for i := range segList {
+		wordType := wordTypes[i]
+		switch wordType {
+		case "n": // 名词
+			nounCount++
+		case "v": // 动词
+			verbCount++
+		case "eng": //
+			hasAdverb = true
+		}
+	}
+
+	if nounCount > 0 && verbCount > 0 && hasAdverb {
+		return true
+	}
+
+	return false
+}
+
+func hasEndingPunctuation(sentence string) bool {
+	endings := []string{"。", "？", "！"}
+	for _, ending := range endings {
+		if strings.HasSuffix(sentence, ending) {
+			return true
+		}
+	}
+	return false
 }

@@ -36,16 +36,12 @@ type Docs struct {
 	Docs []Doc `json:"docs"`
 }
 
-func GetEmbedding(httpClient wrapper.HttpClient, apiKey, key, preKey string, cb func(statusCode int, responseHeaders http.Header, responseBody []byte)) {
+func GetEmbedding(httpClient wrapper.HttpClient, apiKey, key string, cb func(statusCode int, responseHeaders http.Header, responseBody []byte)) {
 	// 定义请求体
 	texts := []string{
 		key,
 	}
-	if preKey != "" {
-		texts = []string{
-			preKey, key,
-		}
-	}
+
 	requestEmbedding := dashscope.Request{
 		Model: "text-embedding-v1",
 		Input: dashscope.Input{

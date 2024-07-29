@@ -20,7 +20,6 @@ import (
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 	"github.com/tidwall/gjson"
-	"github.com/yanyiwu/gojieba"
 )
 
 const (
@@ -50,6 +49,7 @@ type AIRagConfig struct {
 	DashScopeClient      wrapper.HttpClient
 	DashScopeAPIKey      string
 	DashVectorClient     wrapper.HttpClient
+	JieClient            wrapper.HttpClient
 	DashVectorAPIKey     string
 	DashVectorCollection string
 
@@ -92,6 +92,20 @@ type KVExtractor struct {
 }
 
 func parseConfig(json gjson.Result, config *AIRagConfig, log wrapper.Log) error {
+
+	serviceName := json.Get("nlp.serviceName").String()
+	servicePort := json.Get("nlp.servicePort").Int()
+	if servicePort == 0 {
+		if strings.HasSuffix(serviceName, ".static") {
+			// 静态IP类型服务的逻辑端口是80
+			servicePort = 80
+		}
+	}
+	config.JieClient = wrapper.NewClusterClient(wrapper.FQDNCluster{
+		FQDN: serviceName,
+		Port: servicePort,
+	})
+
 	config.DashScopeAPIKey = json.Get("dashscope.apiKey").String()
 
 	config.DashScopeClient = wrapper.NewClusterClient(wrapper.DnsCluster{
@@ -157,8 +171,6 @@ func TrimQuote(source string) string {
 }
 
 // 定义一个动态string全局集合
-var allQs []string = make([]string, 0)
-
 var preQs = ""
 var pre2Qs = ""
 
@@ -172,24 +184,32 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 		log.Debugf("parse key from request body failed,cached:%s", config.CacheKeyFrom.RequestBody)
 		return types.ActionContinue
 	}
-	allQs = append(allQs, rawContent)
-	log.Infof("allQs:%s", allQs)
 
 	log.Infof("request body message key:%s", rawContent)
 	ctx.SetContext(CacheKeyContextKey, rawContent)
 
 	actualKey := rawContent
 	// 判断是否是完整的句子
-	if !isSentenceComplete(rawContent) {
-		if preQs == "" {
-			log.Infof("rawContent is not SentenceComplete and preQs is empty, key:%s", rawContent)
-			return types.ActionContinue
-		} else if pre2Qs == "" {
-			actualKey = preQs + rawContent
-		} else {
-			actualKey = pre2Qs + rawContent
-		}
-	}
+
+	config.JieClient.Post(
+		"/segment",
+		[][2]string{{"Content-Type", "application/json"}},
+		[]byte(fmt.Sprintf(`{"text":"%s"}`, rawContent)),
+		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+			res := string(responseBody)
+			//转成bool
+			if !strings.Contains(res, "true") {
+				if preQs == "" {
+					log.Infof("rawContent is not SentenceComplete and preQs is empty, key:%s", rawContent)
+					return
+				} else if pre2Qs == "" {
+					actualKey = preQs + rawContent
+				} else {
+					actualKey = pre2Qs + rawContent
+				}
+			}
+		},
+	)
 
 	embedding.GetEmbedding(config.DashScopeClient, config.DashScopeAPIKey, actualKey, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
 		log.Infof("text-keyEmbedding,key:%s,status:%d", rawContent, statusCode)
@@ -452,53 +472,4 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 	preQs = question
 
 	return chunk
-}
-
-func isSentenceComplete(sentence string) bool {
-	if !hasEndingPunctuation(sentence) {
-		return false
-	}
-
-	jieba := gojieba.NewJieba()
-	segList := jieba.Cut(sentence, true)
-
-	var wordTypes []string
-	for _, word := range segList {
-		words := jieba.Tag(word)
-		wordType := words[0]
-		wordType = strings.Split(wordType, "/")[1]
-		wordTypes = append(wordTypes, wordType)
-	}
-
-	nounCount := 0
-	verbCount := 0
-	hasAdverb := false
-
-	for i := range segList {
-		wordType := wordTypes[i]
-		switch wordType {
-		case "n": // 名词
-			nounCount++
-		case "v": // 动词
-			verbCount++
-		case "eng": //
-			hasAdverb = true
-		}
-	}
-
-	if nounCount > 0 && verbCount > 0 && hasAdverb {
-		return true
-	}
-
-	return false
-}
-
-func hasEndingPunctuation(sentence string) bool {
-	endings := []string{"。", "？", "！"}
-	for _, ending := range endings {
-		if strings.HasSuffix(sentence, ending) {
-			return true
-		}
-	}
-	return false
 }

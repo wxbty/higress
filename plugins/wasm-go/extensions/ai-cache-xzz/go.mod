@@ -11,7 +11,6 @@ require (
 	github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20240327114451-d6b7174a84fc
 	github.com/tidwall/gjson v1.14.3
 	github.com/tidwall/sjson v1.2.5
-	github.com/yanyiwu/gojieba v1.4.1
 )
 
 require (

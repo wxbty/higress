@@ -103,6 +103,7 @@ func parseConfig(json gjson.Result, config *AIRagConfig, log wrapper.Log) error 
 	}
 	config.JieClient = wrapper.NewClusterClient(wrapper.FQDNCluster{
 		FQDN: serviceName,
+		Host: serviceName,
 		Port: servicePort,
 	})
 
@@ -191,12 +192,13 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 	actualKey := rawContent
 	// 判断是否是完整的句子
 
-	config.JieClient.Post(
+	err := config.JieClient.Post(
 		"/segment",
 		[][2]string{{"Content-Type", "application/json"}},
 		[]byte(fmt.Sprintf(`{"text":"%s"}`, rawContent)),
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
 			res := string(responseBody)
+			log.Infof("jieba response:%s", res)
 			//转成bool
 			if !strings.Contains(res, "true") {
 				if preQs == "" {
@@ -210,6 +212,10 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 			}
 		},
 	)
+	if err != nil {
+		log.Errorf("failed to post: %s", err)
+		return types.ActionContinue
+	}
 
 	embedding.GetEmbedding(config.DashScopeClient, config.DashScopeAPIKey, actualKey, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
 		log.Infof("text-keyEmbedding,key:%s,status:%d", rawContent, statusCode)

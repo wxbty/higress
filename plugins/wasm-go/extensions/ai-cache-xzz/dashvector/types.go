@@ -22,5 +22,7 @@ type OutputObject struct {
 }
 
 type FieldObject struct {
-	Data string `json:"data"`
+	Data  string `json:"data"`
+	DocId string `json:"doc_id"`
+	KEY   string `json:"key"`
 }

@@ -36,8 +36,11 @@ build-image:
 	@echo ""
 	@echo "image:            ${IMG}"
 
-build-push: build-image
-	docker push ${IMG}
+build-push: build-image # 依赖于 build-image 目标
+	@echo "Tagging the image..."
+	docker tag ${IMG} registry.cn-hangzhou.aliyuncs.com/ydegg/xzz:${VER}
+	@echo "Pushing the image..."
+	docker push registry.cn-hangzhou.aliyuncs.com/ydegg/xzz:${VER}
 
 # builder:
 # To build a wasm-go-builder image.

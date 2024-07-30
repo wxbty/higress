@@ -79,7 +79,9 @@ type Docs struct {
 }
 
 type Fields struct {
-	DATA string `json:"data"`
+	DATA  string `json:"data"`
+	DocId string `json:"doc_id"`
+	KEY   string `json:"key"`
 }
 
 type KVExtractor struct {
@@ -103,7 +105,6 @@ func parseConfig(json gjson.Result, config *AIRagConfig, log wrapper.Log) error 
 	}
 	config.JieClient = wrapper.NewClusterClient(wrapper.FQDNCluster{
 		FQDN: serviceName,
-		Host: serviceName,
 		Port: servicePort,
 	})
 
@@ -210,75 +211,135 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 					actualKey = pre2Qs + rawContent
 				}
 			}
+			pre2Qs = preQs
+			preQs = rawContent
+			log.Infof("preQs set:%s", preQs)
+			embedding.GetEmbedding(config.DashScopeClient, config.DashScopeAPIKey, actualKey, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+				log.Infof("text-keyEmbedding,key:%s,status:%d", actualKey, statusCode)
+
+				ebd, keyEmbedding := getEbd(responseBody)
+
+				localQsVal := localCache.RetrieveBestAnswer(actualKey, keyEmbedding)
+				if localQsVal != "" {
+					ctx.SetContext(ToolCallsContextKey, struct{}{})
+					proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, localQsVal)), -1)
+					return
+				}
+
+				log.Infof("localQsVal not exist, begin query embedding service")
+				ctx.SetContext(CacheEmbeddingKey, ebd)
+				embedding.QueryValByEmbeddingKey(config.DashVectorClient, config.DashVectorAPIKey, config.DashVectorCollection, keyEmbedding, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+					var response dashvector.Response
+					_ = json.Unmarshal(responseBody, &response)
+					objects := response.Output
+					log.Infof("QueryValByEmbeddingKey response:%d", len(objects))
+
+					if len(objects) == 0 {
+						log.Infof("ebd cache miss, key:%s", actualKey)
+						newContent := config.CacheKeyFrom.Prefix + rawContent
+						log.Infof("new content:%s", newContent)
+						newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
+						if err != nil {
+							log.Errorf("Failed to set new value in JSON: %v", err)
+						}
+						// 替换请求体
+						if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
+							log.Errorf("Failed to replace HTTP request body: %v", err)
+						}
+						proxywasm.ResumeHttpRequest()
+						return
+					}
+
+					doc := objects[0].Fields.Data
+					score := objects[0].Score
+					log.Infof("QueryValByEmbeddingKey response:%s,score:%f", doc, score)
+					if score > 0.27 {
+						log.Infof("cache miss, score:%f", score)
+						newContent := config.CacheKeyFrom.Prefix + rawContent
+						log.Infof("new content:%s", newContent)
+						newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
+						if err != nil {
+							log.Errorf("Failed to set new value in JSON: %v", err)
+						}
+						// 替换请求体
+						if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
+							log.Errorf("Failed to replace HTTP request body: %v", err)
+						}
+						proxywasm.ResumeHttpRequest()
+						return
+					} else if len(objects) == 1 {
+						if strings.Contains(actualKey, objects[0].Fields.KEY) {
+							log.Infof("cache miss, score:%f", score)
+							newContent := config.CacheKeyFrom.Prefix + rawContent
+							log.Infof("new content:%s", newContent)
+							newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
+							if err != nil {
+								log.Errorf("Failed to set new value in JSON: %v", err)
+							}
+							// 替换请求体
+							if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
+								log.Errorf("Failed to replace HTTP request body: %v", err)
+							}
+							proxywasm.ResumeHttpRequest()
+							return
+						} else {
+							// 计算答案的相似度
+							log.Infof("vector cache hit, actualKey:%s, score: %f", actualKey, score)
+							ctx.SetContext(ToolCallsContextKey, struct{}{})
+							proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, doc)), -1)
+						}
+					} else if len(objects) == 2 {
+						doc = objects[1].Fields.Data
+						score = objects[1].Score
+						if score > 0.27 {
+							log.Infof("cache miss, score:%f", score)
+							newContent := config.CacheKeyFrom.Prefix + rawContent
+							log.Infof("new content:%s", newContent)
+							newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
+							if err != nil {
+								log.Errorf("Failed to set new value in JSON: %v", err)
+							}
+							// 替换请求体
+							if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
+								log.Errorf("Failed to replace HTTP request body: %v", err)
+							}
+							proxywasm.ResumeHttpRequest()
+							return
+						} else if strings.Contains(actualKey, objects[1].Fields.KEY) {
+							log.Infof("cache miss, score:%f", score)
+							newContent := config.CacheKeyFrom.Prefix + rawContent
+							log.Infof("new content:%s", newContent)
+							newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
+							if err != nil {
+								log.Errorf("Failed to set new value in JSON: %v", err)
+							}
+							// 替换请求体
+							if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
+								log.Errorf("Failed to replace HTTP request body: %v", err)
+							}
+							proxywasm.ResumeHttpRequest()
+							return
+						} else {
+							// 计算答案的相似度
+							log.Infof("vector cache hit, actualKey:%s, score: %f", actualKey, score)
+							ctx.SetContext(ToolCallsContextKey, struct{}{})
+							proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, doc)), -1)
+						}
+					} else {
+						// 计算答案的相似度
+						log.Infof("vector cache hit, actualKey:%s, score: %f", actualKey, score)
+						ctx.SetContext(ToolCallsContextKey, struct{}{})
+						proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, doc)), -1)
+					}
+				})
+
+			})
 		},
 	)
 	if err != nil {
 		log.Errorf("failed to post: %s", err)
 		return types.ActionContinue
 	}
-
-	embedding.GetEmbedding(config.DashScopeClient, config.DashScopeAPIKey, actualKey, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-		log.Infof("text-keyEmbedding,key:%s,status:%d", rawContent, statusCode)
-
-		ebd, keyEmbedding := getEbd(responseBody)
-
-		localQsVal := localCache.RetrieveBestAnswer(actualKey, keyEmbedding)
-		if localQsVal != "" {
-			ctx.SetContext(ToolCallsContextKey, struct{}{})
-			proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, localQsVal)), -1)
-			return
-		}
-
-		log.Infof("localQsVal not exist, begin query embedding service")
-		ctx.SetContext(CacheEmbeddingKey, ebd)
-		embedding.QueryValByEmbeddingKey(config.DashVectorClient, config.DashVectorAPIKey, config.DashVectorCollection, keyEmbedding, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			var response dashvector.Response
-			_ = json.Unmarshal(responseBody, &response)
-			objects := response.Output
-			log.Infof("QueryValByEmbeddingKey response:%d", len(objects))
-
-			if len(objects) == 0 {
-				log.Infof("ebd cache miss, key:%s", rawContent)
-				newContent := config.CacheKeyFrom.Prefix + rawContent
-				log.Infof("new content:%s", newContent)
-				newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
-				if err != nil {
-					log.Errorf("Failed to set new value in JSON: %v", err)
-				}
-				// 替换请求体
-				if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
-					log.Errorf("Failed to replace HTTP request body: %v", err)
-				}
-				proxywasm.ResumeHttpRequest()
-				return
-			}
-
-			doc := objects[0].Fields.Data
-			score := objects[0].Score
-			log.Infof("QueryValByEmbeddingKey response:%s,score:%f", doc, score)
-			if score < 0.27 {
-				// 计算答案的相似度
-				log.Infof("vector cache hit, score: %f", score)
-				ctx.SetContext(ToolCallsContextKey, struct{}{})
-				proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, doc)), -1)
-
-			} else {
-				log.Infof("cache miss, score:%f", score)
-				newContent := config.CacheKeyFrom.Prefix + rawContent
-				log.Infof("new content:%s", newContent)
-				newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
-				if err != nil {
-					log.Errorf("Failed to set new value in JSON: %v", err)
-				}
-				// 替换请求体
-				if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
-					log.Errorf("Failed to replace HTTP request body: %v", err)
-				}
-				proxywasm.ResumeHttpRequest()
-			}
-		})
-
-	})
 
 	return types.ActionPause
 }
@@ -451,7 +512,9 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 		ID:     docID,
 		Vector: keyEbd.Embedding,
 		FIELDS: Fields{
-			DATA: answer,
+			DATA:  answer,
+			DocId: docID,
+			KEY:   question,
 		},
 	}
 
@@ -471,11 +534,8 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 	)
 
 	if err != nil {
-		fmt.Printf("failed to post: %s", err)
+		log.Infof("failed to post: %s", err)
 	}
-
-	pre2Qs = preQs
-	preQs = question
 
 	return chunk
 }

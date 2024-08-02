@@ -182,18 +182,13 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 		log.Debugf("parse key from request body failed,cached:%s", config.CacheKeyFrom.RequestBody)
 		return types.ActionContinue
 	}
-
 	log.Infof("request body message key:%s", rawContent)
-	ctx.SetContext(CacheKeyContextKey, rawContent)
-
 	actualKey := rawContent
-
 	err := config.JieClient.Post(
 		"/segment",
 		[][2]string{{"Content-Type", "application/json"}},
 		[]byte(fmt.Sprintf(`{"text":"%s"}`, rawContent)),
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			//res转json
 			var resJson map[string]interface{}
 			err := json.Unmarshal(responseBody, &resJson)
 			if err != nil {
@@ -201,25 +196,44 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 				proxywasm.ResumeHttpRequest()
 				return
 			}
-			res, _ := resJson["complete"].(string)
+			complete, _ := resJson["complete"].(bool)
 			preQs := resJson["preKey"].(string)
 			pre2Qs := resJson["pre2Key"].(string)
+			log.Infof("jieba response:%s", resJson)
+			// new一个string数组
+			keyArr := make([]string, 0)
+			keyArr = append(keyArr, rawContent)
 
-			log.Infof("jieba response:%s", res)
-
-			//完整语句
-			if strings.Contains(res, "true") {
-				fetchEmdIfExist(config, actualKey, log, ctx, rawContent, body)
+			if complete {
+				fetchEmdIfExist(config, actualKey, log, ctx, rawContent, body, keyArr)
 			} else {
 				if pre2Qs == "" {
 					actualKey = preQs + rawContent
+					keyArr = append(keyArr, preQs)
 				} else {
 					actualKey = pre2Qs + rawContent
+					keyArr = append(keyArr, pre2Qs)
 				}
 				log.Infof("get key:%s", actualKey)
-				fetchEmdIfExist(config, actualKey, log, ctx, rawContent, body)
+				fetchEmdIfExist(config, actualKey, log, ctx, rawContent, body, keyArr)
 			}
-
+			// 将key数组序列化为json字符串
+			keyArrStr, _ := json.Marshal(keyArr)
+			ctx.SetContext(CacheKeyContextKey, string(keyArrStr))
+			if preQs != "" {
+				config.JieClient.Post(
+					"/set/pre2Key",
+					[][2]string{{"Content-Type", "application/json"}},
+					[]byte(fmt.Sprintf(`{"value":"%s"}`, preQs)),
+					func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+					})
+			}
+			config.JieClient.Post(
+				"/set/preKey",
+				[][2]string{{"Content-Type", "application/json"}},
+				[]byte(fmt.Sprintf(`{"value":"%s"}`, rawContent)),
+				func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+				})
 		},
 	)
 	if err != nil {
@@ -230,7 +244,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 	return types.ActionPause
 }
 
-func fetchEmdIfExist(config AIRagConfig, actualKey string, log wrapper.Log, ctx wrapper.HttpContext, rawContent string, body []byte) {
+func fetchEmdIfExist(config AIRagConfig, actualKey string, log wrapper.Log, ctx wrapper.HttpContext, rawContent string, body []byte, newKeyArr []string) {
 	embedding.GetEmbedding(config.DashScopeClient, config.DashScopeAPIKey, actualKey, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
 		log.Infof("text-keyEmbedding,key:%s,status:%d", actualKey, statusCode)
 
@@ -285,7 +299,25 @@ func fetchEmdIfExist(config AIRagConfig, actualKey string, log wrapper.Log, ctx 
 				proxywasm.ResumeHttpRequest()
 				return
 			} else if len(objects) == 1 {
-				if strings.Contains(actualKey, objects[0].Fields.KEY) {
+				keyArrStr := objects[0].Fields.KEY
+				//转回keyArr
+				var keyArr []string
+				_ = json.Unmarshal([]byte(keyArrStr), &keyArr)
+				//判断newKeyArr和keyArr是否有交集
+				isHasSameKey := false
+				for _, key := range keyArr {
+					for _, newKey := range newKeyArr {
+						if key == newKey {
+							isHasSameKey = true
+							break
+						}
+					}
+					if isHasSameKey {
+						break
+					}
+				}
+
+				if isHasSameKey {
 					log.Infof("cache miss, score:%f", score)
 					newContent := config.CacheKeyFrom.Prefix + rawContent
 					log.Infof("new content:%s", newContent)
@@ -308,6 +340,25 @@ func fetchEmdIfExist(config AIRagConfig, actualKey string, log wrapper.Log, ctx 
 			} else if len(objects) == 2 {
 				doc = objects[1].Fields.Data
 				score = objects[1].Score
+
+				keyArrStr := objects[1].Fields.KEY
+				//转回keyArr
+				var keyArr []string
+				_ = json.Unmarshal([]byte(keyArrStr), &keyArr)
+				//判断newKeyArr和keyArr是否有交集
+				isHasSameKey := false
+				for _, key := range keyArr {
+					for _, newKey := range newKeyArr {
+						if key == newKey {
+							isHasSameKey = true
+							break
+						}
+					}
+					if isHasSameKey {
+						break
+					}
+				}
+
 				if score > 0.27 {
 					log.Infof("cache miss, score:%f", score)
 					newContent := config.CacheKeyFrom.Prefix + rawContent
@@ -322,7 +373,7 @@ func fetchEmdIfExist(config AIRagConfig, actualKey string, log wrapper.Log, ctx 
 					}
 					proxywasm.ResumeHttpRequest()
 					return
-				} else if strings.Contains(actualKey, objects[1].Fields.KEY) {
+				} else if isHasSameKey {
 					log.Infof("cache miss, score:%f", score)
 					newContent := config.CacheKeyFrom.Prefix + rawContent
 					log.Infof("new content:%s", newContent)
@@ -457,7 +508,10 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 	}
 
 	log.Info("onHttpResponseBody body message 2")
-	// last chunk
+	// 获取keyI的类型
+	keyIType := fmt.Sprintf("%T", keyI)
+	log.Infof("keyIType:%s", keyIType)
+
 	question := keyI.(string)
 	var answer string
 	stream := ctx.GetContext(StreamContextKey)

@@ -176,13 +176,13 @@ func TrimQuote(source string) string {
 func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte, log wrapper.Log) types.Action {
 	bodyJson := gjson.ParseBytes(body)
 
-	log.Infof("request body message:%s", bodyJson)
+	log.Errorf("request body message:%s", bodyJson)
 	rawContent := TrimQuote(bodyJson.Get(config.CacheKeyFrom.RequestBody).Raw)
 	if rawContent == "" {
 		log.Debugf("parse key from request body failed,cached:%s", config.CacheKeyFrom.RequestBody)
 		return types.ActionContinue
 	}
-	log.Infof("request body message key:%s", rawContent)
+	log.Errorf("request body message key:%s", rawContent)
 	actualKey := rawContent
 	err := config.JieClient.Post(
 		"/segment",
@@ -199,13 +199,13 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 			complete, _ := resJson["complete"].(bool)
 			preQs := resJson["preKey"].(string)
 			pre2Qs := resJson["pre2Key"].(string)
-			log.Infof("jieba response:%s", resJson)
+			log.Errorf("jieba response:%s", resJson)
 			// new一个string数组
 			keyArr := make([]string, 0)
 			keyArr = append(keyArr, rawContent)
 
 			if complete {
-				fetchEmdIfExist(config, actualKey, log, ctx, rawContent, body, keyArr)
+				fetchEmdIfExist(config, actualKey, log, ctx, rawContent, body, keyArr, complete)
 			} else {
 				if pre2Qs == "" {
 					actualKey = preQs + rawContent
@@ -214,8 +214,8 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 					actualKey = pre2Qs + rawContent
 					keyArr = append(keyArr, pre2Qs)
 				}
-				log.Infof("get key:%s", actualKey)
-				fetchEmdIfExist(config, actualKey, log, ctx, rawContent, body, keyArr)
+				log.Errorf("get key:%s", actualKey)
+				fetchEmdIfExist(config, actualKey, log, ctx, rawContent, body, keyArr, complete)
 			}
 			// 将key数组序列化为json字符串
 			keyArrStr, _ := json.Marshal(keyArr)
@@ -244,31 +244,24 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIRagConfig, body []byte,
 	return types.ActionPause
 }
 
-func fetchEmdIfExist(config AIRagConfig, actualKey string, log wrapper.Log, ctx wrapper.HttpContext, rawContent string, body []byte, newKeyArr []string) {
+func fetchEmdIfExist(config AIRagConfig, actualKey string, log wrapper.Log, ctx wrapper.HttpContext, rawContent string, body []byte, newKeyArr []string, complete bool) {
 	embedding.GetEmbedding(config.DashScopeClient, config.DashScopeAPIKey, actualKey, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-		log.Infof("text-keyEmbedding,key:%s,status:%d", actualKey, statusCode)
+		log.Errorf("text-keyEmbedding,key:%s,status:%d", actualKey, statusCode)
 
 		ebd, keyEmbedding := getEbd(responseBody)
 
-		localQsVal := localCache.RetrieveBestAnswer(actualKey, keyEmbedding)
-		if localQsVal != "" {
-			ctx.SetContext(ToolCallsContextKey, struct{}{})
-			proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, localQsVal)), -1)
-			return
-		}
-
-		log.Infof("localQsVal not exist, begin query embedding service")
+		log.Errorf("localQsVal not exist, begin query embedding service")
 		ctx.SetContext(CacheEmbeddingKey, ebd)
 		embedding.QueryValByEmbeddingKey(config.DashVectorClient, config.DashVectorAPIKey, config.DashVectorCollection, keyEmbedding, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
 			var response dashvector.Response
 			_ = json.Unmarshal(responseBody, &response)
 			objects := response.Output
-			log.Infof("QueryValByEmbeddingKey response:%d", len(objects))
+			log.Errorf("QueryValByEmbeddingKey response:%d", len(objects))
 
 			if len(objects) == 0 {
-				log.Infof("ebd cache miss, key:%s", actualKey)
+				log.Errorf("ebd cache miss, key:%s", actualKey)
 				newContent := config.CacheKeyFrom.Prefix + rawContent
-				log.Infof("new content:%s", newContent)
+				log.Errorf("new content:%s", newContent)
 				newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
 				if err != nil {
 					log.Errorf("Failed to set new value in JSON: %v", err)
@@ -283,11 +276,11 @@ func fetchEmdIfExist(config AIRagConfig, actualKey string, log wrapper.Log, ctx 
 
 			doc := objects[0].Fields.Data
 			score := objects[0].Score
-			log.Infof("QueryValByEmbeddingKey response:%s,score:%f", doc, score)
+			log.Errorf("QueryValByEmbeddingKey response:%s,score:%f", doc, score)
 			if score > 0.27 {
-				log.Infof("cache miss, score:%f", score)
+				log.Errorf("cache miss, score:%f", score)
 				newContent := config.CacheKeyFrom.Prefix + rawContent
-				log.Infof("new content:%s", newContent)
+				log.Errorf("new content:%s", newContent)
 				newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
 				if err != nil {
 					log.Errorf("Failed to set new value in JSON: %v", err)
@@ -317,10 +310,10 @@ func fetchEmdIfExist(config AIRagConfig, actualKey string, log wrapper.Log, ctx 
 					}
 				}
 
-				if isHasSameKey {
-					log.Infof("cache miss, score:%f", score)
+				if isHasSameKey && !complete {
+					log.Errorf("cache miss, score:%f", score)
 					newContent := config.CacheKeyFrom.Prefix + rawContent
-					log.Infof("new content:%s", newContent)
+					log.Errorf("new content:%s", newContent)
 					newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
 					if err != nil {
 						log.Errorf("Failed to set new value in JSON: %v", err)
@@ -333,7 +326,7 @@ func fetchEmdIfExist(config AIRagConfig, actualKey string, log wrapper.Log, ctx 
 					return
 				} else {
 					// 计算答案的相似度
-					log.Infof("vector cache hit, actualKey:%s, score: %f", actualKey, score)
+					log.Errorf("vector cache hit, actualKey:%s, score: %f", actualKey, score)
 					ctx.SetContext(ToolCallsContextKey, struct{}{})
 					proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, doc)), -1)
 				}
@@ -360,9 +353,9 @@ func fetchEmdIfExist(config AIRagConfig, actualKey string, log wrapper.Log, ctx 
 				}
 
 				if score > 0.27 {
-					log.Infof("cache miss, score:%f", score)
+					log.Errorf("cache miss, score:%f", score)
 					newContent := config.CacheKeyFrom.Prefix + rawContent
-					log.Infof("new content:%s", newContent)
+					log.Errorf("new content:%s", newContent)
 					newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
 					if err != nil {
 						log.Errorf("Failed to set new value in JSON: %v", err)
@@ -374,9 +367,9 @@ func fetchEmdIfExist(config AIRagConfig, actualKey string, log wrapper.Log, ctx 
 					proxywasm.ResumeHttpRequest()
 					return
 				} else if isHasSameKey {
-					log.Infof("cache miss, score:%f", score)
+					log.Errorf("cache miss, score:%f", score)
 					newContent := config.CacheKeyFrom.Prefix + rawContent
-					log.Infof("new content:%s", newContent)
+					log.Errorf("new content:%s", newContent)
 					newBody, err := sjson.SetBytes(body, config.CacheKeyFrom.RequestBodyT, []byte(newContent))
 					if err != nil {
 						log.Errorf("Failed to set new value in JSON: %v", err)
@@ -389,13 +382,13 @@ func fetchEmdIfExist(config AIRagConfig, actualKey string, log wrapper.Log, ctx 
 					return
 				} else {
 					// 计算答案的相似度
-					log.Infof("vector cache hit, actualKey:%s, score: %f", actualKey, score)
+					log.Errorf("vector cache hit, actualKey:%s, score: %f", actualKey, score)
 					ctx.SetContext(ToolCallsContextKey, struct{}{})
 					proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, doc)), -1)
 				}
 			} else {
 				// 计算答案的相似度
-				log.Infof("vector cache hit, actualKey:%s, score: %f", actualKey, score)
+				log.Errorf("vector cache hit, actualKey:%s, score: %f", actualKey, score)
 				ctx.SetContext(ToolCallsContextKey, struct{}{})
 				proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, doc)), -1)
 			}
@@ -456,7 +449,7 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config AIRagConfig, log wrap
 
 func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byte, isLastChunk bool, log wrapper.Log) []byte {
 
-	log.Info("onHttpResponseBody body message")
+	log.Error("onHttpResponseBody body message")
 
 	if ctx.GetContext(ToolCallsContextKey) != nil {
 		return chunk
@@ -507,16 +500,16 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 		return chunk
 	}
 
-	log.Info("onHttpResponseBody body message 2")
+	log.Error("onHttpResponseBody body message 2")
 	// 获取keyI的类型
 	keyIType := fmt.Sprintf("%T", keyI)
-	log.Infof("keyIType:%s", keyIType)
+	log.Errorf("keyIType:%s", keyIType)
 
 	question := keyI.(string)
 	var answer string
 	stream := ctx.GetContext(StreamContextKey)
 
-	log.Info("onHttpResponseBody body message 3")
+	log.Error("onHttpResponseBody body message 3")
 
 	if stream == nil {
 		var body []byte
@@ -558,7 +551,7 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 		}
 	}
 
-	log.Infof("onHttpResponseBody body message answer:%s 5", answer)
+	log.Errorf("onHttpResponseBody body message answer:%s 5", answer)
 	keyEbd := keyE.(dashscope.Embedding)
 	// 提取向量并创建Doc数组
 	docs := make([]Doc, 1)
@@ -591,7 +584,7 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIRagConfig, chunk []byt
 	)
 
 	if err != nil {
-		log.Infof("failed to post: %s", err)
+		log.Errorf("failed to post: %s", err)
 	}
 
 	return chunk
